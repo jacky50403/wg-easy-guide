@@ -1,11 +1,10 @@
 # 自建 VPN 完整教學：用 wg-easy 架設 WireGuard 伺服器
 
-從只有 SSH 可以登入的 Ubuntu A1 主機開始，完成 Docker 安裝、Oracle 網路設定、wg-easy 初始化與手機 VPN 連線測試。管理介面先透過 SSH 通道存取，日後可再調整為 VPN 內網或 HTTPS 網址。
+從只有 SSH 可以登入的 Ubuntu A1 主機開始，完成 Docker 安裝、Oracle 網路設定、免費 DuckDNS 子網域、Caddy HTTPS 反向代理、wg-easy 初始化與手機 VPN 連線測試。完成後，直接用瀏覽器開啟 HTTPS 網址管理 VPN。
 
 本文以 **2026-11-11** 查閱的 **wg-easy v15.5.0 專案範例**為基準，部署路徑統一使用 **`/opt/wg-easy`**。本文所稱「官方範例」是指 **wg-easy 專案自己發布的範例**；wg-easy 是第三方專案，並非 WireGuard 官方推出的管理介面。
 
 > 適用範圍：全新的 Oracle Cloud A1、Ubuntu 24.04 LTS、ARM64、已有公網 IPv4，且可以用 `ubuntu` 帳號與 SSH 私鑰登入。本文先驗證 IPv4 VPN，不涵蓋完整的 IPv6 對外連線設定。
->
 
 ## 目錄
 
@@ -15,7 +14,7 @@
 4. [Oracle 網路規則](#4-oracle-網路規則)
 5. [建立 Compose 設定](#5-建立-compose-設定)
 6. [啟動與檢查服務](#6-啟動與檢查服務)
-7. [透過 Windows SSH 通道開啟管理頁](#7-透過-windows-ssh-通道開啟管理頁)
+7. [設定免費網域與 Caddy HTTPS 反向代理](#7-設定免費網域與-caddy-https-反向代理)
 8. [wg-easy 初始化](#8-wg-easy-初始化)
 9. [建立裝置與驗證 VPN](#9-建立裝置與驗證-vpn)
 10. [日常管理與更新](#10-日常管理與更新)
@@ -33,11 +32,16 @@
 | 設定檔 | `/opt/wg-easy/compose.yaml` |
 | 容器映像 | `ghcr.io/wg-easy/wg-easy:15`，沿用專案範例標籤 |
 | VPN 入口 | A1 公網 IPv4 的 UDP `51820` |
-| 管理介面 | A1 本機 `127.0.0.1:51821`，由 SSH 通道存取 |
+| 管理介面 | `https://vpn.myserver.duckdns.org`，由 Caddy 反向代理 |
+| Caddy 部署目錄 | `/opt/caddy`，包含 `compose.yaml` 與 `Caddyfile` |
+| 反向代理網路 | 獨立的 Docker bridge 網路 `caddy`，供 Caddy 與後端服務共用 |
+| HTTPS 入口 | TCP `443`；TCP `80` 用於憑證驗證及轉址 |
 | Docker 內部網路 | 沿用範例 `10.42.42.0/24` 與 IPv6 ULA 網段 |
 | wg-easy 容器 IPv4 | 沿用範例 `10.42.42.42` |
 | VPN 測試範圍 | IPv4；本文設定 `DISABLE_IPV6=true` |
 | 持久資料 | 沿用範例的 `etc_wireguard` named volume |
+
+`myserver` 是本文的示範名稱，請換成自己在 DuckDNS 申請的名稱。
 
 這裡有三種不同的位址：
 
@@ -45,12 +49,16 @@
 - **Docker 容器 IP**，例如 `10.42.42.42`：Docker 內部使用，不是手機連線時填寫的伺服器地址。
 - **VPN 裝置 IP**：裝置連上 VPN 後使用，由 wg-easy 設定分配。
 
+管理頁網域由 DNS 指向 A1 公網 IP，再由 Caddy 依網址轉發到 wg-easy。HTTPS 管理頁與 UDP `51820` 的 VPN 連線是兩個入口。
+
 ### 需要先準備
 
 - A1 的公網 IPv4。
 - 能登入 Oracle Console、修改主機所屬網路規則的權限。
 - SSH 私鑰，以及能登入 A1 的 SSH 客戶端。
 - 一台可安裝 WireGuard App 的手機，用行動網路測試。
+- 可登入 DuckDNS 的帳號；已有自己的網域也可以使用。
+- A1 的 TCP `80`、`443` 尚未被其他服務占用。
 
 **Linux 指令**在 A1 的 SSH 終端機執行；標為 **PowerShell** 的指令在自己的 Windows 電腦執行。指令中的示範路徑、IP 或檔名請依註解替換。
 
@@ -124,6 +132,14 @@ sudo docker compose version
 
 看到 `Hello from Docker!` 與 Compose 版本，代表基本環境可用。
 
+**本教學需要 Docker Compose 2.36.0 以上**，用來固定 wg-easy 在兩張網路中的介面名稱與預設閘道。若版本太舊，先更新 Compose plugin，再繼續：
+
+```bash
+sudo apt update
+sudo apt install --only-upgrade docker-compose-plugin
+sudo docker compose version
+```
+
 本文統一使用 `sudo docker ...`，因此不需要額外把帳號加入 `docker` 群組。
 
 接著確認 WireGuard 核心模組能載入：
@@ -144,40 +160,45 @@ sudo modprobe wireguard
 
 沿用既有 VCN 與子網路，不需要為此再建立一套網路。
 
-### 4.2 新增 VPN 的 ingress rule
+### 4.2 新增 VPN 與 HTTPS 的 ingress rules
 
-在 Oracle Console 找到 A1 使用的子網路及 Security List。常見路徑：
+在 Oracle Console 找到 A1 **實際使用的子網路及關聯的 Security List**。常見路徑：
 
 **Networking → Virtual cloud networks → 你的 VCN → Subnets → 使用中的公用子網路 → Security lists → 使用中的 Security List → Add ingress rules**。
 
-新增：
+新增以下三條 **Ingress Rules**：
 
-| 欄位 | 設定 |
-|---|---|
-| Stateless | 不勾選，使用 stateful 規則 |
-| Source Type | CIDR |
-| Source CIDR | `0.0.0.0/0` |
-| IP Protocol | UDP |
-| Source Port Range | All／留空 |
-| Destination Port Range | `51820` |
-| Description | `WireGuard VPN` |
+| 欄位 | VPN | HTTP／憑證驗證 | HTTPS 管理頁 |
+|---|---|---|---|
+| Stateless | 不勾選 | 不勾選 | 不勾選 |
+| Source Type | CIDR | CIDR | CIDR |
+| Source CIDR | `0.0.0.0/0` | `0.0.0.0/0` | `0.0.0.0/0` |
+| IP Protocol | UDP | TCP | TCP |
+| Source Port Range | All／留空 | All／留空 | All／留空 |
+| Destination Port Range | `51820` | `80` | `443` |
+| Description | `WireGuard VPN` | `HTTP for Caddy` | `HTTPS for Caddy` |
 
-保留原有 SSH 與其他必要規則。本文假設沿用允許一般對外流量的 egress 設定；若有另外限制 egress 或主機防火牆，也需要確認 VPN 所需流量能通過。
+**連接埠填在 Destination Port Range，不是 Source Port Range。** 容器顯示 `Up` 只代表程式在主機上運作，並不代表 Oracle 已允許外部連線。
+
+保留原有 SSH 與其他必要規則。本文假設沿用允許一般對外流量的 egress 設定；若有另外限制 egress 或主機防火牆，也需要確認 VPN、DNS 查詢及憑證申請所需流量能通過。
 
 Security List 規則會套用至與它關聯的子網路；也可以依自己的管理方式，改用掛在該 A1 VNIC 上的 NSG。
 
-**此部署不需要對外開放 TCP `51821`**。這是管理頁的連接埠，稍後會限制在 A1 本機。
-
-來源：[Oracle Security Lists](https://docs.oracle.com/en-us/iaas/Content/Network/Concepts/securitylists.htm)、[wg-easy Basic Installation](https://wg-easy.github.io/wg-easy/latest/examples/tutorials/basic-installation/)。
+來源：[Oracle Security Lists](https://docs.oracle.com/en-us/iaas/Content/Network/Concepts/securitylists.htm)、[wg-easy Basic Installation](https://wg-easy.github.io/wg-easy/latest/examples/tutorials/basic-installation/)、[Caddy Automatic HTTPS](https://caddyserver.com/docs/automatic-https)。
 
 ## 5. 建立 Compose 設定
 
-### 5.1 建立目錄
+### 5.1 建立獨立的 Caddy 網路與部署目錄
+
+先建立共用的反向代理網路；若已存在，沿用它：
 
 ```bash
+sudo docker network inspect caddy >/dev/null 2>&1 || sudo docker network create caddy
 sudo mkdir -p /opt/wg-easy
 cd /opt/wg-easy
 ```
+
+兩份 Compose 都把 `caddy` 宣告為 external network，這樣可以先啟動 wg-easy，稍後再設定 Caddy。與官方範例「由 Caddy Compose 建立同名網路」的差別是建立方式；服務仍透過獨立的 `caddy` 網路互通。日後單獨移除其中一個 Compose 專案，也不會由它自動刪掉這張共用網路。
 
 ### 5.2 寫入設定
 
@@ -191,7 +212,6 @@ volumes:
 services:
   wg-easy:
     environment:
-      - INSECURE=true
       - DISABLE_IPV6=true
 
     image: ghcr.io/wg-easy/wg-easy:15
@@ -200,12 +220,15 @@ services:
       wg:
         ipv4_address: 10.42.42.42
         ipv6_address: fdcc:ad94:bacf:61a3::2a
+        interface_name: eth0
+        gw_priority: 1
+      caddy:
+        interface_name: eth1
     volumes:
       - etc_wireguard:/etc/wireguard
       - /lib/modules:/lib/modules:ro
     ports:
       - "51820:51820/udp"
-      - "127.0.0.1:51821:51821/tcp"
     restart: unless-stopped
     cap_add:
       - NET_ADMIN
@@ -226,6 +249,9 @@ networks:
       config:
         - subnet: 10.42.42.0/24
         - subnet: fdcc:ad94:bacf:61a3::/64
+  caddy:
+    external: true
+    name: caddy
 EOF
 ```
 
@@ -233,15 +259,18 @@ EOF
 
 | 項目 | 原始範例 | 本文 | 原因 |
 |---|---|---|---|
-| HTTP 管理頁 | 預設 `INSECURE=false` | `INSECURE=true` | 允許在 SSH 加密通道內使用 HTTP |
-| 管理頁映射 | `51821:51821/tcp` | `127.0.0.1:51821:51821/tcp` | 管理入口只綁定 A1 本機 |
+| 管理頁映射 | `51821:51821/tcp` | 移除這條映射 | 只讓 Caddy 從 Docker 內部網路連入 |
 | VPN IPv6 | 預設啟用 | `DISABLE_IPV6=true` | 本教學先驗證 IPv4 VPN |
+| 反向代理網路 | 基本範例只有 `wg` 網路 | 額外加入獨立的 `caddy` 網路 | 讓 Caddy 與多個後端服務共用反向代理網路 |
+| 出口介面及閘道 | 單一網路 | `wg` 固定為 `eth0` 並設定 `gw_priority: 1`；`caddy` 為 `eth1` | 新增第二張網路後，仍讓 VPN 對外流量走原本的 `wg` 網路 |
+
+`interface_name` 固定容器介面名稱；`gw_priority` 選擇預設閘道。不要用 `priority` 代替，Docker 文件明確指出它不負責固定介面名稱或選擇預設閘道。這裡需要 Compose 2.36.0 以上。
 
 其他核心配置保留原樣。Docker 內部 IPv6 網路仍沿用範例，但 `DISABLE_IPV6` 讓 wg-easy 不替 VPN 介面與裝置啟用 IPv6；兩者是不同層的網路設定。依專案文件，即使管理頁仍顯示 IPv6 欄位，也不代表它已在 VPN 中使用。
 
 **這不會關閉手機或電腦原有的 IPv6。** 本文只能確認 IPv4 是否經 A1 轉送；若要求 IPv6 也經 VPN，需要另行完成並驗證整條 IPv6 路徑。
 
-來源：[v15.5.0 原始 Compose](https://github.com/wg-easy/wg-easy/blob/v15.5.0/docker-compose.yml)、[Optional Configuration](https://wg-easy.github.io/wg-easy/latest/advanced/config/optional-config/)、[Docker port publishing](https://docs.docker.com/engine/network/port-publishing/)、[Docker volumes](https://docs.docker.com/engine/storage/volumes/)。
+來源：[v15.5.0 原始 Compose](https://github.com/wg-easy/wg-easy/blob/v15.5.0/docker-compose.yml)、[Optional Configuration](https://wg-easy.github.io/wg-easy/latest/advanced/config/optional-config/)、[Docker port publishing](https://docs.docker.com/engine/network/port-publishing/)、[Docker volumes](https://docs.docker.com/engine/storage/volumes/)、[Compose 網路介面與閘道設定](https://docs.docker.com/reference/compose-file/services/#networks)。
 
 ## 6. 啟動與檢查服務
 
@@ -263,86 +292,219 @@ sudo docker compose logs --tail=50 wg-easy
 
 預期容器保持 `Up`／`running`，可能另顯示健康檢查狀態。剛啟動時可以稍等片刻，再檢查一次。
 
-測試 A1 本機管理頁：
-
-```bash
-curl -I http://127.0.0.1:51821
-```
-
-收到正常 HTTP 回應，例如成功或重新導向，代表網頁服務有回應。若容器持續重新啟動或有錯誤，先看紀錄，不要先改 Oracle 管理頁連接埠規則。
+此時還沒有 HTTPS 管理入口，先完成下一節的 DuckDNS 與 Caddy 設定，再開啟管理頁。本文沒有把 `51821` 映射到主機，因此不使用 `http://127.0.0.1:51821` 測試。若容器持續重新啟動或有錯誤，先看紀錄。
 
 > Docker 的 bridge 網路會建立轉送、連接埠映射與 NAT 規則。本文沿用 Docker 預設網路管理方式，沒有清空 Oracle 映像的防火牆，也沒有停用 Docker 的防火牆管理。不要把「清空所有 iptables」當成通用解法。
 
 來源：[Docker packet filtering and firewalls](https://docs.docker.com/engine/network/packet-filtering-firewalls/)。
 
-## 7. 透過 Windows SSH 通道開啟管理頁
+## 7. 設定免費網域與 Caddy HTTPS 反向代理
 
-### 7.1 建立通道
+本節以 `vpn.myserver.duckdns.org` 作為管理網址。**所有 `myserver` 都要換成自己申請的名稱**；如果使用自己的網域，則換成準備好的完整主機名稱。
 
-在**自己的 Windows 電腦**開啟 PowerShell，使用能登入 A1 的私鑰：
+### 7.1 申請 DuckDNS 名稱並指向 A1
+
+1. 開啟 [DuckDNS](https://www.duckdns.org/)，使用網站提供的方式登入。
+2. 在 Domains 輸入通用名稱，例如 `myserver`，按 **add domain**。
+3. 將 **current ip** 改成 **A1 的公網 IPv4**，按 **update ip**。不要保留成自己電腦目前上網的出口 IP。
+4. 本文先使用 IPv4；沒有正確設定 A1 的 IPv6 時，不要填入 IPv6 地址。
+
+DuckDNS 提供的是 `myserver.duckdns.org` 這種免費子網域。它的下一層子網域會自動解析到相同 IP，因此可使用 `vpn.myserver.duckdns.org`，日後也能用 `files.myserver.duckdns.org` 區分服務，不必在 DuckDNS 逐個新增。不同服務由 Caddy 按網址轉發。
+
+若 A1 的公網 IP 日後改變，記得更新 DuckDNS。這份教學先手動設定 IP，沒有另外安裝 DDNS 自動更新程式。
+
+來源：[DuckDNS About](https://www.duckdns.org/about.jsp)、[DuckDNS API](https://www.duckdns.org/spec.jsp)、[LinuxServer 關於 DuckDNS 下一層子網域的說明](https://docs.linuxserver.io/general/swag/#nextcloud-subdomain-reverse-proxy-example)。
+
+### 7.2 確認 DNS 和連接埠
+
+在自己的 Windows PowerShell 執行，換成自己的完整網域：
 
 ```powershell
-# 換成你自己的私鑰完整路徑與 A1 公網 IPv4。
-$keyPath = "C:\Users\你的帳號\.ssh\ssh-key.key"
-$serverIp = "203.0.113.10"
-
-ssh -i "$keyPath" -o ExitOnForwardFailure=yes -N -L 127.0.0.1:51821:127.0.0.1:51821 "ubuntu@$serverIp"
+Resolve-DnsName vpn.myserver.duckdns.org -Type A
+Resolve-DnsName vpn.myserver.duckdns.org -Type AAAA
 ```
 
-`203.0.113.10` 是文件用的示範 IP，務必替換。
+- A 記錄應回傳 **A1 的公網 IPv4**。
+- AAAA 沒有記錄可以；若有記錄，必須確實指向已設定好網路與防火牆的 A1 IPv6。錯誤的 AAAA 記錄也可能影響驗證或存取。
 
-第一次連線可能要求確認主機指紋。可透過已信任的 A1 SSH 連線或主控台，取得主機的 ED25519 公鑰指紋：
+在 A1 確認 `80`、`443` 是否已有程式監聽：
 
 ```bash
-ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+sudo ss -ltnp '( sport = :80 or sport = :443 )'
 ```
 
-確認和 Windows 顯示的 `SHA256:...` 相同後，再輸入 `yes`。
+乾淨主機通常只會顯示表頭。若已經有 Caddy、Nginx 或其他服務使用這兩個連接埠，先確認現有部署，不要再啟動第二套服務搶用相同埠。
 
-通道成功後，PowerShell 會保持開著，通常沒有額外輸出；`-N` 表示不開啟互動式 shell，這是正常現象。
+### 7.3 確認獨立的 Caddy 網路
 
-在自己電腦的瀏覽器開啟：
+第 5 節已建立共用網路 `caddy`，並讓 wg-easy 加入。在 A1 確認：
 
-**<http://127.0.0.1:51821>**
+```bash
+sudo docker network inspect caddy --format '{{range .Containers}}{{println .Name}}{{end}}'
+```
 
-SSH 通道只供目前這台電腦使用；手機的 `127.0.0.1` 指的是手機自己，不能用相同網址直接存取電腦上開的通道。
+此時應能看到 `wg-easy`；下一步啟動 Caddy 後，兩個容器都會出現在這張網路中。
 
-### 7.2 如果出現 Windows 私鑰權限錯誤
+Caddy 只加入 `caddy` 網路；wg-easy 同時保留原本的 `wg` 網路與新增的 `caddy` 網路。日後其他網頁服務也可以加入 `caddy`，不必共用 VPN 原本的 `wg` 網路。
 
-常見錯誤：
+### 7.4 建立 Caddy 的兩個設定檔
+
+在 A1 執行：
+
+```bash
+sudo mkdir -p /opt/caddy
+cd /opt/caddy
+```
+
+**第一個檔案：`compose.yaml`。這段可直接貼上。**
+
+```bash
+sudo tee /opt/caddy/compose.yaml >/dev/null <<'EOF'
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - caddy
+
+networks:
+  caddy:
+    external: true
+    name: caddy
+
+volumes:
+  caddy_data:
+  caddy_config:
+EOF
+```
+
+**第二個檔案：`Caddyfile`。先把完整網域換成自己的名稱，再貼上。**
+
+```bash
+sudo tee /opt/caddy/Caddyfile >/dev/null <<'EOF'
+vpn.myserver.duckdns.org {
+    reverse_proxy wg-easy:51821
+}
+EOF
+```
+
+Caddy 根據這個公開網域申請憑證，再把管理頁請求轉發到 `wg-easy:51821`。
+
+這個配置與 wg-easy 專案的 Caddy 範例使用相同的反向代理原理，配合本教學調整如下：
+
+| 項目 | 本文設定 |
+|---|---|
+| Caddy 映像 | 官方 `caddy:2-alpine`，追蹤 Caddy 2 Alpine 標籤 |
+| 共用 Docker 網路 | 獨立的 `caddy` 網路，預先建立，兩個 Compose 專案都以 external 方式加入 |
+| 後端管理埠 | 沿用 wg-easy 預設的 `51821`，不另改成 `80` |
+| 網域設定 | 直接填在 Caddyfile |
+| 公開憑證 | 不加入 `tls internal`，由 Caddy 自動申請公開憑證 |
+| HTTP/3 | 本文只映射 TCP `443`，先以 HTTP/1.1、HTTP/2 使用；不需要 UDP `443` |
+
+**不要照抄 `tls internal`**：那是 Caddy 內部 CA 的憑證，需要用戶端另外信任它；本教學要的是一般瀏覽器可驗證的公開憑證。
+
+`caddy_data` 保存憑證和 ACME 帳號資料，`caddy_config` 保存 Caddy 設定狀態。保留這些 volume，避免每次重建都重新註冊或申請憑證。
+
+來源：[wg-easy Caddy 範例](https://wg-easy.github.io/wg-easy/latest/examples/tutorials/caddy/)、[Caddy 官方容器映像](https://hub.docker.com/_/caddy)、[Caddy Automatic HTTPS](https://caddyserver.com/docs/automatic-https)、[Compose 共用既有網路](https://docs.docker.com/compose/how-tos/networking/)。
+
+### 7.5 驗證設定並啟動
+
+確認 DNS 正確、第 4 節的 ingress rules 已開放，再執行：
+
+```bash
+cd /opt/caddy
+sudo docker compose config --quiet
+sudo docker compose pull
+sudo docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+```
+
+確認沒有設定錯誤後啟動：
+
+```bash
+sudo docker compose up -d
+sudo docker compose ps
+sudo docker compose logs --tail=100 caddy
+```
+
+Caddy 會自動申請憑證、後續自動續期，並將一般 HTTP 請求轉到 HTTPS。第一次申請可能需要稍等片刻。本配置使用從外部連入的 ACME 驗證方式，不需要 DuckDNS token。
+
+### 7.6 開啟 HTTPS 管理頁
+
+在電腦或手機的瀏覽器開啟自己的網址：
 
 ```text
-WARNING: UNPROTECTED PRIVATE KEY FILE!
-Permissions for '...ssh-key.key' are too open.
-This private key will be ignored.
-Permission denied (publickey).
+https://vpn.myserver.duckdns.org
 ```
 
-這表示 Windows OpenSSH 不願使用權限過寬的私鑰。以下指令只處理指定的私鑰檔案；在 Windows PowerShell 執行，第一行換成實際路徑：
+正常應顯示 wg-easy 初始化或登入頁，而且瀏覽器沒有憑證警告。
+
+這裡的 HTTPS 保護的是**管理頁**。WireGuard 的 VPN 連線仍走 UDP `51820`，不需要因為管理網址改變就重新匯出所有裝置設定。
+
+### 7.7 常見問題
+
+**憑證申請顯示 `Timeout during connect (likely firewall problem)`**
+
+先看錯誤中的 IP 是否等於 A1 公網 IP，再確認 **實際關聯的 Security List／NSG** 已新增 TCP `80`、`443` 的 ingress rules。只開 VPN 的 UDP `51820` 不夠。
+
+在 Windows PowerShell 測試：
 
 ```powershell
-$keyPath = "C:\Users\你的帳號\.ssh\ssh-key.key"
-$accountName = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-
-icacls "$keyPath" /setowner "$accountName"
-icacls "$keyPath" /grant:r "${accountName}:R"
-icacls "$keyPath" /inheritance:r
-icacls "$keyPath" /remove:g "*S-1-5-32-545" "*S-1-5-11" "*S-1-1-0"
-
-icacls "$keyPath"
+Test-NetConnection vpn.myserver.duckdns.org -Port 80
+Test-NetConnection vpn.myserver.duckdns.org -Port 443
 ```
 
-這會保留目前帳號的讀取權限、移除繼承權限，並移除 `Users`、`Authenticated Users`、`Everyone` 等群組的明確授權。使用 SID 可避免中英文 Windows 群組名稱不同的問題。
+兩個都應顯示 `TcpTestSucceeded : True`。這只能確認 TCP 可連，還需要實際用 HTTPS 網址確認憑證和管理頁。
 
-如果顯示拒絕存取，用**同一個 Windows 帳號的系統管理員 PowerShell**再處理。若修正後仍顯示 `Bad permissions`，檢查最後的 ACL 輸出是否還有其他使用者的授權。若權限錯誤消失但仍是 `Permission denied (publickey)`，再核對私鑰、A1 IP 與登入帳號是否正確。
+若要確認 A1 本機的 Caddy 是否回應，在 A1 執行：
 
-修正權限通常只做一次；日後仍需在每次管理時開啟 SSH 通道。關閉通道不會停止 wg-easy 或 VPN。
+```bash
+curl -I -H 'Host: vpn.myserver.duckdns.org' http://127.0.0.1
+```
 
-來源：[Win32 OpenSSH 檔案權限說明](https://github.com/PowerShell/Win32-OpenSSH/wiki/Security-protection-of-various-files-in-win32-openssh)、[Microsoft icacls](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls)。
+通常會收到 `308` 等轉址回應。本機有回應、外部卻連不上時，優先檢查 DNS、Oracle 規則及主機防火牆。不要直接清空 iptables。修正後 Caddy 會依日誌顯示的時間自動重試，不必反覆刪除憑證資料或重新部署。
+
+**HTTPS 開得到，但顯示 `502 Bad Gateway`**
+
+代表請求已到 Caddy，接著檢查 wg-easy 狀態、兩個容器是否都加入 `caddy` 網路，以及後端連接埠：
+
+```bash
+cd /opt/wg-easy
+sudo docker compose ps
+sudo docker compose logs --tail=50 wg-easy
+
+cd /opt/caddy
+sudo docker compose exec caddy sh -c 'wget -S -O /dev/null http://wg-easy:51821'
+```
+
+Caddy 和 wg-easy 必須共用 Docker 網路；**Caddy 容器裡的 `127.0.0.1` 是 Caddy 自己**，所以後端應填 `wg-easy:51821`。
+
+**出現憑證警告**
+
+確認使用的是 Caddyfile 設定的完整 HTTPS 網域，且 Caddyfile 沒有 `tls internal`。不要用 A1 公網 IP 代替網域測試這張網域憑證。
+
+**其他啟動訊息**
+
+`Caddyfile input is not formatted` 是排版提醒；`:80` 出現 HTTP/2／HTTP/3 因需要 TLS 而跳過，也不代表 HTTPS `443` 啟動失敗。以憑證申請結果和實際 HTTPS 存取判斷。
+
+查看即時紀錄：
+
+```bash
+cd /opt/caddy
+sudo docker compose logs --tail=50 -f caddy
+```
+
+按 `Ctrl+C` 只會退出日誌查看，不會停止服務。
 
 ## 8. wg-easy 初始化
 
-第一次開啟管理頁後，依畫面建立管理帳號：
+第一次透過自己的 HTTPS 網址開啟管理頁後，依畫面建立管理帳號：
 
 | 畫面項目 | 填寫內容 |
 |---|---|
@@ -356,7 +518,7 @@ icacls "$keyPath"
 
 `Existing Setup` 的匯入功能是針對專案支援的舊版本設定；不要把其他 WireGuard Docker 專案的設定檔當成可直接匯入的 wg-easy 備份。
 
-完成後可啟用管理帳號的 2FA，並妥善保存恢復所需資訊。
+完成後建議在右上角帳號選單的 **Account** 頁面啟用 2FA，並妥善保存恢復所需資訊。管理頁已可從外網連入，請使用獨立且足夠強的管理密碼。
 
 來源：[wg-easy Setup](https://wg-easy.github.io/wg-easy/latest/guides/setup/)、[wg-easy 2FA](https://wg-easy.github.io/wg-easy/latest/guides/2fa/)。
 
@@ -422,12 +584,18 @@ sudo docker exec wg-easy wg show
 
 ## 10. 日常管理與更新
 
+wg-easy 與 Caddy 是兩個 Compose 專案，分別在 `/opt/wg-easy` 與 `/opt/caddy` 管理。
+
 ### 查看狀態與紀錄
 
 ```bash
 cd /opt/wg-easy
 sudo docker compose ps
 sudo docker compose logs --tail=100 wg-easy
+
+cd /opt/caddy
+sudo docker compose ps
+sudo docker compose logs --tail=100 caddy
 ```
 
 ### 修改設定
@@ -461,6 +629,30 @@ sudo docker compose ps
 
 若改用固定版本標籤，先修改 `image` 的版本，再執行同樣命令。跨主要版本時依專案的 migration 文件處理。
 
+### 修改或更新 Caddy
+
+編輯設定：
+
+```bash
+sudo nano /opt/caddy/Caddyfile
+```
+
+只修改 Caddyfile 時，先驗證再重新載入：
+
+```bash
+cd /opt/caddy
+sudo docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+```
+
+若修改 Compose，使用 `sudo docker compose up -d` 套用。只更換 Caddyfile 的網域或轉發規則，則驗證後 reload 即可；新網域還需要正確 DNS 及憑證。更新 Caddy 映像則執行：
+
+```bash
+cd /opt/caddy
+sudo docker compose pull
+sudo docker compose up -d
+```
+
 ### 停止與啟動
 
 ```bash
@@ -478,7 +670,7 @@ sudo docker inspect wg-easy --format '{{range .Mounts}}{{println .Type .Source "
 sudo docker volume ls
 ```
 
-找到指向 `/etc/wireguard` 的 volume，備份時應包含其完整內容，並考慮資料庫的一致性；只複製 `compose.yaml` 不夠。備份含私鑰與登入資料，應存放於私人位置。
+找到指向 `/etc/wireguard` 的 volume，備份時應包含其完整內容，並考慮資料庫的一致性；只複製 `compose.yaml` 不夠。Caddy 另需保留 `compose.yaml`、`Caddyfile` 和實際掛載至 `/data` 的 volume；本教學預設通常為 `caddy_caddy_data`。備份含私鑰與登入資料，應存放於私人位置。
 
 若資料夾或專案名稱變更，也要確認實際 volume 保持一致，避免連到新的空 volume。
 
@@ -486,17 +678,23 @@ sudo docker volume ls
 
 ## 11. 日後調整
 
-### 改成 VPN 內網管理
+### 增加其他服務的子網域
 
-之後可以調整管理頁的綁定地址、路由與防火牆，只讓 VPN 裝置存取。本文目前綁在 `127.0.0.1`，因此手機只是連上 VPN，並不會自動取得這個 localhost 管理入口。
+同一個 DuckDNS 名稱可以繼續使用下一層名稱，例如 `files.myserver.duckdns.org`。讓新服務的 Compose 也以 external 方式加入 `caddy` 網路後，在 Caddyfile 新增該完整網域的 site block，轉發到那個服務的容器名稱與內部埠。新服務不需要加入 wg-easy 原本的 `wg` 網路。
 
-### 改成外網 HTTPS 管理
+DNS 解析、Caddy 路由與後端服務都需要設定正確。對一般 HTTP 網站使用反向代理，不代表 WireGuard 的 UDP VPN 流量也會自動經過 Caddy。
 
-可依專案文件加入 Caddy 或其他反向代理、網域及適當的雲端防火牆規則。屆時重新檢查 `INSECURE` 與代理信任設定，保留同一個 VPN volume 即可。
+### 只允許特定來源或 VPN 內網管理
 
-若使用 Caddy 的公開網域與自動公開憑證，依照 Caddy Automatic HTTPS 文件設定。專案 Caddy 範例若含 `tls internal`，使用的是 Caddy 內部 CA，不能直接當成所有瀏覽器自動信任的公開憑證。
+本文的管理入口對外提供 HTTPS。若日後改成只允許自己的來源 IP 或 VPN 裝置，需另外設計 Caddy 的存取規則、路由及憑證驗證方式；不要只關掉必要連接埠，導致後續憑證無法續期。
 
-來源：[wg-easy Caddy 範例](https://wg-easy.github.io/wg-easy/latest/examples/tutorials/caddy/)、[Caddy Automatic HTTPS](https://caddyserver.com/docs/automatic-https)。
+### 外網登入保護與代理資訊
+
+wg-easy 官方文件說明它沒有內建登入請求速率限制。除強密碼與 2FA 外，可依需求參考官方的 Caddy 範例，加入適當的速率限制模組或 CrowdSec 等防護。
+
+如果要讓 wg-easy 的安全紀錄顯示原始用戶端 IP，可依實際版本及部署設定 `TRUSTED_PROXIES`，只信任真正的 Caddy 來源地址；不要設成信任所有來源。本教學沒有先填入可能隨容器重建改變的代理 IP，也不把啟用此功能當成 HTTPS 運作的必要條件。
+
+來源：[wg-easy Caddy 範例與速率限制說明](https://wg-easy.github.io/wg-easy/latest/examples/tutorials/caddy/)、[wg-easy Optional Configuration](https://wg-easy.github.io/wg-easy/latest/advanced/config/optional-config/)。
 
 ## 12. 參考文件
 
@@ -505,7 +703,13 @@ sudo docker volume ls
 - [wg-easy v15.5.0 release](https://github.com/wg-easy/wg-easy/releases/tag/v15.5.0)
 - [wg-easy Basic Installation](https://wg-easy.github.io/wg-easy/latest/examples/tutorials/basic-installation/)
 - [wg-easy Optional Configuration](https://wg-easy.github.io/wg-easy/latest/advanced/config/optional-config/)
-- [wg-easy No Reverse Proxy](https://wg-easy.github.io/wg-easy/latest/examples/tutorials/reverse-proxyless/)
+- [wg-easy Caddy 範例](https://wg-easy.github.io/wg-easy/latest/examples/tutorials/caddy/)
+- [Caddy Automatic HTTPS](https://caddyserver.com/docs/automatic-https)
+- [Caddy 官方容器映像](https://hub.docker.com/_/caddy)
+- [DuckDNS](https://www.duckdns.org/)
+- [DuckDNS API](https://www.duckdns.org/spec.jsp)
+- [Compose 網路與跨專案連線](https://docs.docker.com/compose/how-tos/networking/)
+- [Compose 網路介面與預設閘道](https://docs.docker.com/reference/compose-file/services/#networks)
 - [Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
 - [Docker Compose 專案名稱](https://docs.docker.com/compose/how-tos/project-name/)
 - [Docker Volumes](https://docs.docker.com/engine/storage/volumes/)
@@ -513,3 +717,4 @@ sudo docker volume ls
 - [OCI 價目表](https://www.oracle.com/cloud/price-list/)
 - [WireGuard 官方下載](https://www.wireguard.com/install/)
 - [WireSock 文件](https://wiresock.net/documentation/wiresock-secure-connect/get-started.html)
+
